@@ -23,6 +23,7 @@ import (
 
 	miniogopolicy "github.com/minio/minio-go/v7/pkg/policy"
 	"github.com/minio/minio-go/v7/pkg/set"
+	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/pkg/v3/policy"
 	"github.com/minio/pkg/v3/policy/condition"
 )
@@ -299,5 +300,78 @@ func TestBucketAccessPolicyToPolicy(t *testing.T) {
 				t.Fatalf("case %v: result: expected: %+v, got: %+v\n", i+1, testCase.expectedResult, result)
 			}
 		}
+	}
+}
+
+// TestIsAllowedSSECConditionalDeny verifies the fix for AccountInfoHandler reporting
+// incorrect write access when a policy uses StringNotEquals on the SSE-C algorithm header.
+//
+// The bug: the admin API request carries no SSE headers, so
+// StringNotEquals { s3:x-amz-server-side-encryption-customer-algorithm: AES256 } evaluates
+// to true (absent key → empty intersection → negated = true) → Deny fires → Write = false.
+//
+// The fix: supplement putCondVals with representative SSE values before the PutObjectAction
+// capability check so the policy engine answers "can the user write with proper SSE headers?"
+func TestIsAllowedSSECConditionalDeny(t *testing.T) {
+	// Build StringNotEquals { s3:x-amz-server-side-encryption-customer-algorithm: AES256 }.
+	denyCondFn, err := condition.NewStringNotEqualsFunc(
+		"",
+		condition.S3XAmzServerSideEncryptionCustomerAlgorithm.ToKey(),
+		xhttp.AmzEncryptionAES,
+	)
+	if err != nil {
+		t.Fatalf("failed to build StringNotEquals condition: %v", err)
+	}
+
+	p := policy.Policy{
+		Version: policy.DefaultVersion,
+		Statements: []policy.Statement{
+			// Allow broad access on 12345* buckets (mirrors the reported issue's policy).
+			policy.NewStatement(
+				"",
+				policy.Allow,
+				policy.NewActionSet(policy.AllActions),
+				policy.NewResourceSet(
+					policy.NewResource("12345*"),
+					policy.NewResource("12345*/*"),
+				),
+				condition.NewFunctions(),
+			),
+			// Deny PutObject on all objects unless SSE-C algorithm header equals AES256.
+			policy.NewStatement(
+				"",
+				policy.Deny,
+				policy.NewActionSet(policy.PutObjectAction),
+				policy.NewResourceSet(policy.NewResource("*/*")),
+				condition.NewFunctions(denyCondFn),
+			),
+		},
+	}
+
+	baseArgs := policy.Args{
+		AccountName: "testuser",
+		Action:      policy.PutObjectAction,
+		BucketName:  "12345bucket",
+		ObjectName:  "testobject",
+	}
+
+	// Without the SSE-C header: StringNotEquals evaluates to true (key absent → no
+	// intersection with "AES256" → negated = true) → Deny fires → IsAllowed returns false.
+	// This reproduces the incorrect behavior seen in AccountInfoHandler before the fix.
+	argsNoSSE := baseArgs
+	argsNoSSE.ConditionValues = map[string][]string{}
+	if p.IsAllowed(argsNoSSE) {
+		t.Error("expected IsAllowed=false without SSE-C header (Deny should fire)")
+	}
+
+	// With SSE-C header set to AES256: StringNotEquals evaluates to false → Deny does
+	// not fire → Allow statement matches → IsAllowed returns true.
+	// This confirms that supplementing putCondVals with the SSE key fixes the result.
+	argsWithSSE := baseArgs
+	argsWithSSE.ConditionValues = map[string][]string{
+		xhttp.AmzServerSideEncryptionCustomerAlgorithm: {xhttp.AmzEncryptionAES},
+	}
+	if !p.IsAllowed(argsWithSSE) {
+		t.Error("expected IsAllowed=true with SSE-C header set to AES256")
 	}
 }

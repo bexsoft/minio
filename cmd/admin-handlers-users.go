@@ -38,6 +38,7 @@ import (
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/config/dns"
+	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/mux"
 	xldap "github.com/minio/pkg/v3/ldap"
@@ -1384,12 +1385,28 @@ func (a adminAPIHandlers) AccountInfoHandler(w http.ResponseWriter, r *http.Requ
 			rd = true
 		}
 
+		// Supplement condition values for the write capability check.
+		// The admin API request carries no SSE headers, so SSE-based conditional
+		// Deny statements would incorrectly block write capability detection.
+		// We add representative values for the two well-known SSE condition keys
+		// so the policy engine evaluates "can the user write with proper SSE headers?"
+		// rather than "is this admin request authorized?".
+		//
+		// Note: KMS key ID conditions (x-amz-server-side-encryption-aws-kms-key-id)
+		// with a specific key ARN cannot be generalized and remain a known limitation.
+		putCondVals := maps.Clone(getConditionValues(r, "", cred))
+		if _, ok := putCondVals[xhttp.AmzServerSideEncryptionCustomerAlgorithm]; !ok {
+			putCondVals[xhttp.AmzServerSideEncryptionCustomerAlgorithm] = []string{xhttp.AmzEncryptionAES}
+		}
+		if _, ok := putCondVals[xhttp.AmzServerSideEncryption]; !ok {
+			putCondVals[xhttp.AmzServerSideEncryption] = []string{xhttp.AmzEncryptionAES, xhttp.AmzEncryptionKMS}
+		}
 		if globalIAMSys.IsAllowed(policy.Args{
 			AccountName:     cred.AccessKey,
 			Groups:          cred.Groups,
 			Action:          policy.PutObjectAction,
 			BucketName:      bucketName,
-			ConditionValues: getConditionValues(r, "", cred),
+			ConditionValues: putCondVals,
 			IsOwner:         owner,
 			ObjectName:      "",
 			Claims:          cred.Claims,
